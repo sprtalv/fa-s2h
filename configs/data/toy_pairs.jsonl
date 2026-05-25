@@ -1,0 +1,1 @@
+{"pair_id":"toy_0001","source_path":"tests/assets/smoke_source.png","target_path":"tests/assets/smoke_target.png","target_keywords":["smoke","test","target"],"split":"toy","notes":"SMOKE_TEST asset pair for local pipeline verification only"}

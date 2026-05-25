@@ -1,0 +1,63 @@
+defaults:
+  - ../model/clip_3surrogate
+
+experiment:
+  name: fas2h_skeleton
+  seed: 42
+  output_dir: outputs/runs
+
+data:
+  pair_file: configs/data/toy_pairs.jsonl
+  image_size: 224
+
+model:
+  shallow_layers: [2, 3, 4]
+  return_attention: true
+  attention_extraction: interface_only
+
+route:
+  rho: 0.33
+  topk_ratio: 0.10
+  source_score:
+    alpha_attn: 0.4
+    beta_cls: 0.3
+    gamma_global: 0.3
+  target_score:
+    lambda_path: 0.5
+    lambda_sem: 0.5
+  head_aggregation: mean
+  bank_mode: hard_topk
+  static_bank: true
+  static_source_carrier: true
+  refresh_interval: null
+
+projection:
+  type: identity
+
+attack:
+  eps: 8/255
+  steps: 100
+  step_size: 1/255
+  random_start: false
+  norm: linf
+
+loss:
+  injection:
+    enabled: true
+    tau: 0.07
+  route:
+    enabled: false
+    weight: 0.05
+  coverage:
+    enabled: false
+    weight: 0.05
+
+cache:
+  enabled: true
+  cache_dir: outputs/caches
+  overwrite: false
+
+logging:
+  save_loss_curve: true
+  save_heatmaps: true
+  save_config: true

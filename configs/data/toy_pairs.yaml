@@ -1,0 +1,2 @@
+pair_file: configs/data/toy_pairs.jsonl
+limit: 1

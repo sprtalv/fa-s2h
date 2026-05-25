@@ -1,0 +1,15 @@
+torch
+torchvision
+open_clip_torch
+timm
+hydra-core
+omegaconf
+pillow
+numpy
+tqdm
+pyyaml
+rich
+matplotlib
+pytest
+pandas
+einops

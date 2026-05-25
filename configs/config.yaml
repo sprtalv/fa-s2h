@@ -1,0 +1,21 @@
+defaults:
+  - attack: fas2h_mvp
+  - model: clip_3surrogate
+  - data: toy_pairs
+  - eval: none
+  - _self_
+
+project:
+  name: FA-S2H
+  package: fas2h
+  current_stage: stage2_mvp
+
+runtime:
+  seed: 42
+  device: auto
+  output_dir: outputs/runs
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

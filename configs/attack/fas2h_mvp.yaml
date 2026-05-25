@@ -1,0 +1,40 @@
+name: fas2h_mvp
+shallow_layers: [0, 1, 2, 3]
+layer_index_base: 0
+topk_ratio: 0.2
+
+source_score:
+  alpha_attn: 0.3333333333
+  beta_cls: 0.3333333333
+  gamma_global: 0.3333333333
+  head_aggregation: mean
+
+target_score:
+  lambda_path: 0.5
+  lambda_sem: 0.5
+  rollout_add_residual: true
+  rollout_normalize: row
+
+projection:
+  type: identity
+
+loss:
+  active: inj_only
+  tau: 0.07
+  lambda_route: 0.0
+  lambda_anchor: 0.0
+  route_loss_enabled: false
+  anchor_loss_enabled: false
+
+pgd:
+  eps: 0.062745098
+  step_size: 0.0039215686
+  steps: 50
+  random_start: false
+  clamp_min: 0.0
+  clamp_max: 1.0
+
+bank:
+  static_target_bank: true
+  static_source_carrier: true
+  refresh_interval: null
