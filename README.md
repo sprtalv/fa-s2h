@@ -360,6 +360,13 @@ This creates `experiments/active/YYYYMMDD_<name>/` and records:
 - `summary.json`
 - `logs/`
 
+Run directory naming:
+
+- By default, runtime output folders are auto-named from config values.
+- The generated pattern is `{attack}_{data}_n{limit}_steps{steps}_seed{seed}_{timestamp}`.
+- Example: `outputs/runs_resources/fas2h_mvp_res1000_n5_steps200_seed42_20260526_123456/`
+- Set `runtime.auto_name=false` if you want to fall back to `{attack.name}_{timestamp}` naming.
+
 Archive or discard an experiment:
 
 ```bash

@@ -10,8 +10,9 @@ The current implementation is intentionally scoped to the confirmed MVP:
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 import torch
@@ -34,6 +35,12 @@ def _tensor_to_list(value: torch.Tensor | None) -> Any:
     if value is None:
         return None
     return value.detach().cpu().tolist()
+
+
+def _slugify(value: str) -> str:
+    """Convert free-form text into a filesystem-friendly token."""
+    compact = re.sub(r"[^A-Za-z0-9]+", "_", value.strip())
+    return compact.strip("_").lower() or "unknown"
 
 
 class FAS2HAttack:
@@ -60,10 +67,34 @@ class FAS2HAttack:
         for model in self.models:
             model.load()
 
+    def _data_name(self) -> str:
+        """Build a short dataset token from the configured pair file."""
+        pair_file = Path(str(self.data_cfg.pair_file))
+        stem = pair_file.stem
+        if stem == "resources_pairs_1000":
+            return "res1000"
+        return _slugify(stem)
+
+    def _build_auto_run_stem(self) -> str:
+        """Build a readable run stem from the current config values."""
+        limit = self.data_cfg.limit
+        limit_text = "all" if limit is None else str(limit)
+        return "_".join(
+            [
+                _slugify(str(self.attack_cfg.name)),
+                self._data_name(),
+                f"n{limit_text}",
+                f"steps{int(self.attack_cfg.pgd.steps)}",
+                f"seed{int(self.runtime_cfg.seed)}",
+            ]
+        )
+
     def _run_id(self) -> str:
         """Build a readable run identifier."""
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        return f"{self.attack_cfg.name}_{timestamp}"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        auto_name = bool(getattr(self.runtime_cfg, "auto_name", True))
+        stem = self._build_auto_run_stem() if auto_name else _slugify(str(self.attack_cfg.name))
+        return f"{stem}_{timestamp}"
 
     def _resolve_output_dir(self, run_name: str | None = None) -> Path:
         """Resolve and create the output directory for this run."""
