@@ -3,7 +3,7 @@
 The current implementation is intentionally scoped to the confirmed MVP:
 - fixed source carrier indices;
 - fixed target evidence banks;
-- active loss is `L_inj` only;
+- active loss can be `L_inj` or `L_inj + lambda_route * L_route`;
 - no route amplification loss, no anchor loss, no dynamic refresh.
 """
 
@@ -21,7 +21,7 @@ import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
-from fas2h.attacks.losses import carrier_target_similarity, injection_loss_logsumexp
+from fas2h.attacks.losses import carrier_target_similarity, injection_loss_logsumexp, route_loss
 from fas2h.attacks.pgd import pgd_step
 from fas2h.data.pairs import load_pairs_jsonl
 from fas2h.route.bank import build_target_evidence_bank
@@ -78,6 +78,39 @@ class FAS2HAttack:
             return "random_patch_inj"
         return "fas2h_inj"
 
+    def _objective_name(self) -> str:
+        """Resolve objective name while remaining compatible with existing configs."""
+        objective = getattr(self.attack_cfg, "objective", None)
+        if objective is None:
+            loss_active = getattr(getattr(self.attack_cfg, "loss", {}), "active", "inj_only")
+            return str(loss_active)
+        return str(objective)
+
+    def _active_loss_name(self) -> str:
+        """Resolve active-loss label for metadata logging."""
+        active_loss = getattr(self.attack_cfg, "active_loss", None)
+        if active_loss is not None:
+            return str(active_loss)
+        return str(getattr(getattr(self.attack_cfg, "loss", {}), "active", self._objective_name()))
+
+    def _route_eta_tuple(self) -> tuple[float, float, float]:
+        """Read route component weights from config."""
+        route_cfg = getattr(getattr(self.attack_cfg, "loss", {}), "route", None)
+        if route_cfg is None:
+            return (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+        return (
+            float(getattr(route_cfg, "eta_attn", 1.0 / 3.0)),
+            float(getattr(route_cfg, "eta_cls", 1.0 / 3.0)),
+            float(getattr(route_cfg, "eta_rollout", 1.0 / 3.0)),
+        )
+
+    def _route_enabled(self) -> bool:
+        """Whether route loss should participate in optimization."""
+        route_cfg = getattr(getattr(self.attack_cfg, "loss", {}), "route", None)
+        route_enabled_flag = bool(getattr(route_cfg, "enabled", False)) if route_cfg is not None else False
+        objective = self._objective_name()
+        return objective == "inj_plus_route" and route_enabled_flag
+
     def _data_name(self) -> str:
         """Build a short dataset token from the configured pair file."""
         pair_file = Path(str(self.data_cfg.pair_file))
@@ -88,6 +121,19 @@ class FAS2HAttack:
 
     def _build_auto_run_stem(self) -> str:
         """Build a readable run stem from the current config values."""
+        if bool(getattr(self.runtime_cfg, "run_name_include_params", False)):
+            layers = "".join(str(int(v)) for v in list(self.attack_cfg.shallow_layers))
+            steps = int(self.attack_cfg.pgd.steps)
+            seed = int(self.runtime_cfg.seed)
+            eps_num = int(round(float(self.attack_cfg.pgd.eps) * 255.0))
+            objective = self._objective_name()
+            lambda_route = float(getattr(getattr(self.attack_cfg, "loss", {}), "lambda_route", 0.0))
+            if objective == "inj_plus_route":
+                route_tag = f"route{str(lambda_route).replace('.', '')}"
+                prefix = f"inj_{route_tag}"
+            else:
+                prefix = "inj_only"
+            return f"{prefix}_l{layers}_s{steps}_eps{eps_num}_seed{seed}"
         limit = self.data_cfg.limit
         limit_text = "all" if limit is None else str(limit)
         return "_".join(
@@ -103,6 +149,9 @@ class FAS2HAttack:
     def _run_id(self) -> str:
         """Build a readable run identifier."""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        run_tag = getattr(self.runtime_cfg, "run_tag", None)
+        if run_tag:
+            return f"{_slugify(str(run_tag))}_{timestamp}"
         auto_name = bool(getattr(self.runtime_cfg, "auto_name", True))
         stem = self._build_auto_run_stem() if auto_name else _slugify(str(self.attack_cfg.name))
         return f"{stem}_{timestamp}"
@@ -164,7 +213,7 @@ class FAS2HAttack:
 
     def _compute_injection_objective(
         self,
-        x_adv: torch.Tensor,
+        adv_feature_bundles: dict[str, Any],
         source_routes: dict[str, dict[int, Any]],
         target_banks: dict[str, dict[int, Any]],
     ) -> dict[str, Any]:
@@ -178,7 +227,9 @@ class FAS2HAttack:
         per_layer_sims: dict[str, dict[str, torch.Tensor]] = {}
 
         for model in self.models:
-            adv_features = model.encode_with_features(x_adv, shallow_layers, capture_attn=False)
+            if model.name not in adv_feature_bundles:
+                raise KeyError(f"Missing adv features for model={model.name}")
+            adv_features = adv_feature_bundles[model.name]
             per_model_losses[model.name] = []
             per_model_sims[model.name] = []
             per_layer_losses[model.name] = {}
@@ -232,6 +283,84 @@ class FAS2HAttack:
             "per_model_sim": per_model_sim_scalar,
             "per_layer_sim": per_layer_sims,
         }
+
+    def _compute_adv_features(
+        self,
+        x_adv: torch.Tensor,
+        capture_attn: bool,
+    ) -> dict[str, Any]:
+        """Extract per-model features from current `x_adv`."""
+        shallow_layers = list(self.attack_cfg.shallow_layers)
+        bundles: dict[str, Any] = {}
+        for model in self.models:
+            bundles[model.name] = model.encode_with_features(x_adv, shallow_layers, capture_attn=capture_attn)
+        return bundles
+
+    def _compute_objective(
+        self,
+        x_adv: torch.Tensor,
+        source_routes: dict[str, dict[int, Any]],
+        target_banks: dict[str, dict[int, Any]],
+    ) -> dict[str, Any]:
+        """Compute active objective and full diagnostics for one PGD step."""
+        route_enabled = self._route_enabled()
+        objective_name = self._objective_name()
+        if objective_name == "inj_plus_route" and not route_enabled:
+            raise ValueError(
+                "objective=inj_plus_route requires attack.loss.route.enabled=true. "
+                "Refusing silent downgrade to inj_only."
+            )
+        capture_attn = route_enabled or any(
+            bool(getattr(self.cfg.logging, key, False))
+            for key in (
+                "record_route_attn_score",
+                "record_route_cls_coupling_score",
+                "record_route_rollout_score",
+            )
+        )
+        adv_features = self._compute_adv_features(x_adv=x_adv, capture_attn=capture_attn)
+
+        objective = self._compute_injection_objective(
+            adv_feature_bundles=adv_features,
+            source_routes=source_routes,
+            target_banks=target_banks,
+        )
+
+        loss_inj = objective["loss_inj"]
+        lambda_route = float(getattr(getattr(self.attack_cfg, "loss", {}), "lambda_route", 0.0))
+
+        route_metrics: dict[str, Any] = {
+            "loss_route": None,
+            "route_attn_score": None,
+            "route_cls_coupling_score": None,
+            "route_rollout_score": None,
+            "per_model_loss_route": {},
+            "per_layer_loss_route": {},
+        }
+        if route_enabled:
+            eta_attn, eta_cls, eta_rollout = self._route_eta_tuple()
+            route_metrics = route_loss(
+                adv_feature_bundles=adv_features,
+                source_routes=source_routes,
+                layers=list(self.attack_cfg.shallow_layers),
+                eta_attn=eta_attn,
+                eta_cls=eta_cls,
+                eta_rollout=eta_rollout,
+            )
+            if objective_name != "inj_plus_route":
+                raise ValueError(
+                    f"Route loss is enabled but objective is {objective_name}. "
+                    "Use objective=inj_plus_route for route optimization."
+                )
+            objective["loss_total"] = loss_inj + (lambda_route * route_metrics["loss_route"])
+        else:
+            objective["loss_total"] = loss_inj
+
+        objective["objective"] = objective_name
+        objective["active_loss"] = self._active_loss_name()
+        objective["lambda_route"] = lambda_route
+        objective.update(route_metrics)
+        return objective
 
     def _save_route_metadata(
         self,
@@ -360,7 +489,7 @@ class FAS2HAttack:
         )
         for step_idx in step_iter:
             x_adv.requires_grad_(True)
-            objective = self._compute_injection_objective(
+            objective = self._compute_objective(
                 x_adv=x_adv,
                 source_routes=source_routes,
                 target_banks=target_banks,
@@ -383,6 +512,8 @@ class FAS2HAttack:
             mean_abs_delta = float((x_adv - x_src).abs().mean().detach().cpu().item())
             loss_value = float(objective["loss_total"].detach().cpu().item())
             loss_inj_value = float(objective["loss_inj"].detach().cpu().item())
+            route_loss_tensor = objective.get("loss_route")
+            loss_route_value = float(route_loss_tensor.detach().cpu().item()) if route_loss_tensor is not None else 0.0
             sim_value = float(objective["carrier_target_sim"].detach().cpu().item())
             per_model_loss = {k: float(v.detach().cpu().item()) for k, v in objective["per_model_loss_inj"].items()}
             per_layer_loss: dict[str, dict[str, float]] = {}
@@ -390,27 +521,60 @@ class FAS2HAttack:
                 per_layer_loss[model_name] = {
                     layer_name: float(layer_loss.detach().cpu().item()) for layer_name, layer_loss in layer_map.items()
                 }
+            per_model_route_loss: dict[str, float | None] = {}
+            for model in self.models:
+                model_value = objective.get("per_model_loss_route", {}).get(model.name)
+                per_model_route_loss[model.name] = (
+                    float(model_value.detach().cpu().item()) if isinstance(model_value, torch.Tensor) else None
+                )
+            per_layer_route_loss: dict[str, dict[str, float | None]] = {}
+            for model_name in [m.name for m in self.models]:
+                per_layer_route_loss[model_name] = {}
+                for layer in list(self.attack_cfg.shallow_layers):
+                    layer_key = f"layer_{layer}"
+                    layer_value = objective.get("per_layer_loss_route", {}).get(model_name, {}).get(layer_key)
+                    per_layer_route_loss[model_name][layer_key] = (
+                        float(layer_value.detach().cpu().item()) if isinstance(layer_value, torch.Tensor) else None
+                    )
             per_model_sim = {k: float(v.detach().cpu().item()) for k, v in objective["per_model_sim"].items()}
             per_layer_sim: dict[str, dict[str, float]] = {}
             for model_name, layer_map in objective["per_layer_sim"].items():
                 per_layer_sim[model_name] = {
                     layer_name: float(layer_sim.detach().cpu().item()) for layer_name, layer_sim in layer_map.items()
                 }
+            route_attn_score = objective.get("route_attn_score")
+            route_cls_score = objective.get("route_cls_coupling_score")
+            route_rollout_score = objective.get("route_rollout_score")
             loss_log.append(
                 {
                     "step": float(step_idx),
-                    "loss": loss_value,
                     "loss_total": loss_value,
                     "loss_inj": loss_inj_value,
+                    "loss_route": loss_route_value,
                     "carrier_target_sim": sim_value,
+                    "route_attn_score": (
+                        float(route_attn_score.detach().cpu().item()) if isinstance(route_attn_score, torch.Tensor) else None
+                    ),
+                    "route_cls_coupling_score": (
+                        float(route_cls_score.detach().cpu().item()) if isinstance(route_cls_score, torch.Tensor) else None
+                    ),
+                    "route_rollout_score": (
+                        float(route_rollout_score.detach().cpu().item())
+                        if isinstance(route_rollout_score, torch.Tensor)
+                        else None
+                    ),
                     "linf": linf,
                     "pixel_min": pixel_min,
                     "pixel_max": pixel_max,
                     "mean_abs_delta": mean_abs_delta,
                     "per_model_loss_inj": per_model_loss,
+                    "per_model_loss_route": per_model_route_loss,
                     "per_layer_loss_inj": per_layer_loss,
+                    "per_layer_loss_route": per_layer_route_loss,
                     "per_model_carrier_target_sim": per_model_sim,
                     "per_layer_carrier_target_sim": per_layer_sim,
+                    "objective": objective["objective"],
+                    "active_loss": objective["active_loss"],
                 }
             )
             if bool(getattr(self.runtime_cfg, "progress", True)):
@@ -421,31 +585,63 @@ class FAS2HAttack:
         save_perturbation_visualization(delta, pair_dir / "perturbation.png", eps=float(self.attack_cfg.pgd.eps))
         save_json(pair_dir / "loss_log.json", {"losses": loss_log})
         steps = [int(item["step"]) for item in loss_log]
-        losses = [float(item["loss_inj"]) for item in loss_log]
+        inj_losses = [float(item["loss_inj"]) for item in loss_log]
+        route_losses = [float(item["loss_route"]) if item["loss_route"] is not None else 0.0 for item in loss_log]
+        total_losses = [float(item["loss_total"]) for item in loss_log]
         sims = [float(item["carrier_target_sim"]) for item in loss_log]
+        route_attn_scores = [item.get("route_attn_score") for item in loss_log]
+        route_cls_scores = [item.get("route_cls_coupling_score") for item in loss_log]
+        route_rollout_scores = [item.get("route_rollout_score") for item in loss_log]
         linfs = [float(item["linf"]) for item in loss_log]
         pixel_mins = [float(item["pixel_min"]) for item in loss_log]
         pixel_maxs = [float(item["pixel_max"]) for item in loss_log]
         deltas = [float(item["mean_abs_delta"]) for item in loss_log]
-        slice_n = max(1, math.ceil(len(losses) * 0.1))
-        loss_start = losses[0]
-        loss_end = losses[-1]
-        loss_delta = loss_end - loss_start
-        loss_argmin_index = min(range(len(losses)), key=lambda i: losses[i])
+        slice_n = max(1, math.ceil(len(total_losses) * 0.1))
+        inj_loss_start = inj_losses[0]
+        inj_loss_end = inj_losses[-1]
+        inj_loss_delta = inj_loss_end - inj_loss_start
+        route_loss_start = route_losses[0]
+        route_loss_end = route_losses[-1]
+        route_loss_delta = route_loss_end - route_loss_start
+        total_loss_start = total_losses[0]
+        total_loss_end = total_losses[-1]
+        total_loss_delta = total_loss_end - total_loss_start
+        loss_argmin_index = min(range(len(total_losses)), key=lambda i: total_losses[i])
         per_model_loss_start = loss_log[0]["per_model_loss_inj"]
         per_model_loss_end = loss_log[-1]["per_model_loss_inj"]
-        per_model_loss_delta = {
+        per_model_inj_loss_delta = {
             model_name: float(per_model_loss_end[model_name] - per_model_loss_start[model_name])
             for model_name in per_model_loss_start.keys()
         }
+        per_model_route_loss_start = loss_log[0]["per_model_loss_route"]
+        per_model_route_loss_end = loss_log[-1]["per_model_loss_route"]
+        per_model_route_loss_delta = {
+            model_name: (
+                None
+                if per_model_route_loss_start.get(model_name) is None or per_model_route_loss_end.get(model_name) is None
+                else float(per_model_route_loss_end[model_name] - per_model_route_loss_start[model_name])
+            )
+            for model_name in per_model_route_loss_start.keys()
+        }
         per_layer_loss_start = loss_log[0]["per_layer_loss_inj"]
         per_layer_loss_end = loss_log[-1]["per_layer_loss_inj"]
-        per_layer_loss_delta: dict[str, dict[str, float]] = {}
+        per_layer_inj_loss_delta: dict[str, dict[str, float]] = {}
         for model_name, layers in per_layer_loss_start.items():
-            per_layer_loss_delta[model_name] = {}
+            per_layer_inj_loss_delta[model_name] = {}
             for layer_name in layers.keys():
-                per_layer_loss_delta[model_name][layer_name] = float(
+                per_layer_inj_loss_delta[model_name][layer_name] = float(
                     per_layer_loss_end[model_name][layer_name] - per_layer_loss_start[model_name][layer_name]
+                )
+        per_layer_route_loss_start = loss_log[0]["per_layer_loss_route"]
+        per_layer_route_loss_end = loss_log[-1]["per_layer_loss_route"]
+        per_layer_route_loss_delta: dict[str, dict[str, float | None]] = {}
+        for model_name, layers in per_layer_route_loss_start.items():
+            per_layer_route_loss_delta[model_name] = {}
+            for layer_name in layers.keys():
+                start_val = per_layer_route_loss_start[model_name][layer_name]
+                end_val = per_layer_route_loss_end[model_name][layer_name]
+                per_layer_route_loss_delta[model_name][layer_name] = (
+                    None if start_val is None or end_val is None else float(end_val - start_val)
                 )
         per_model_sim_start = loss_log[0]["per_model_carrier_target_sim"]
         per_model_sim_end = loss_log[-1]["per_model_carrier_target_sim"]
@@ -463,9 +659,26 @@ class FAS2HAttack:
                     per_layer_sim_end[model_name][layer_name] - per_layer_sim_start[model_name][layer_name]
                 )
 
+        def _edge_delta(values: list[float | None]) -> tuple[float | None, float | None, float | None]:
+            if not values:
+                return (None, None, None)
+            if values[0] is None or values[-1] is None:
+                return (None, None, None)
+            return (float(values[0]), float(values[-1]), float(values[-1] - values[0]))
+
+        route_attn_start, route_attn_end, route_attn_delta = _edge_delta(route_attn_scores)
+        route_cls_start, route_cls_end, route_cls_delta = _edge_delta(route_cls_scores)
+        route_rollout_start, route_rollout_end, route_rollout_delta = _edge_delta(route_rollout_scores)
+
+        notes_parts: list[str] = []
+        if not self._route_enabled():
+            notes_parts.append("route loss disabled by objective/config; route fields are logged as null/zero.")
+
         metrics_payload: dict[str, Any] = {
             "pair_id": pair["pair_id"],
             "method": self._method_name(),
+            "objective": self._objective_name(),
+            "active_loss": self._active_loss_name(),
             "selection_mode": str(getattr(self.attack_cfg, "selection_mode", "fas2h")),
             "shallow_layers": list(self.attack_cfg.shallow_layers),
             "topk_ratio": float(self.attack_cfg.topk_ratio),
@@ -474,15 +687,34 @@ class FAS2HAttack:
             "steps": int(self.attack_cfg.pgd.steps),
             "eps": float(self.attack_cfg.pgd.eps),
             "step_size": float(self.attack_cfg.pgd.step_size),
-            "inj_loss_start": loss_start,
-            "inj_loss_end": loss_end,
-            "inj_loss_delta": loss_delta,
-            "inj_loss_relative_change": None if loss_start == 0 else float(loss_delta / abs(loss_start)),
-            "inj_loss_min": float(min(losses)),
+            "lambda_route": float(getattr(getattr(self.attack_cfg, "loss", {}), "lambda_route", 0.0)),
+            "route_eta_attn": self._route_eta_tuple()[0],
+            "route_eta_cls": self._route_eta_tuple()[1],
+            "route_eta_rollout": self._route_eta_tuple()[2],
+            "inj_loss_start": inj_loss_start,
+            "inj_loss_end": inj_loss_end,
+            "inj_loss_delta": inj_loss_delta,
+            "inj_loss_relative_change": None if inj_loss_start == 0 else float(inj_loss_delta / abs(inj_loss_start)),
+            "inj_loss_min": float(min(inj_losses)),
             "inj_loss_argmin_step": int(steps[loss_argmin_index]),
+            "route_loss_start": route_loss_start,
+            "route_loss_end": route_loss_end,
+            "route_loss_delta": route_loss_delta,
+            "total_loss_start": total_loss_start,
+            "total_loss_end": total_loss_end,
+            "total_loss_delta": total_loss_delta,
             "carrier_target_sim_start": sims[0],
             "carrier_target_sim_end": sims[-1],
             "carrier_target_sim_delta": float(sims[-1] - sims[0]),
+            "route_attn_start": route_attn_start,
+            "route_attn_end": route_attn_end,
+            "route_attn_delta": route_attn_delta,
+            "route_cls_coupling_start": route_cls_start,
+            "route_cls_coupling_end": route_cls_end,
+            "route_cls_coupling_delta": route_cls_delta,
+            "route_rollout_start": route_rollout_start,
+            "route_rollout_end": route_rollout_end,
+            "route_rollout_delta": route_rollout_delta,
             "sim_increase_success": bool(sims[-1] > sims[0]),
             "linf_max": float(max(linfs)),
             "linf_end": float(linfs[-1]),
@@ -492,31 +724,51 @@ class FAS2HAttack:
             "pixel_range_valid": bool(min(pixel_mins) >= 0.0 and max(pixel_maxs) <= 1.0),
             "mean_abs_delta_end": float(deltas[-1]),
             "monotonic_decrease_ratio": float(
-                sum(losses[i + 1] < losses[i] for i in range(len(losses) - 1)) / max(1, len(losses) - 1)
+                sum(total_losses[i + 1] < total_losses[i] for i in range(len(total_losses) - 1))
+                / max(1, len(total_losses) - 1)
             ),
-            "first_10pct_mean_loss": float(sum(losses[:slice_n]) / slice_n),
-            "final_10pct_mean_loss": float(sum(losses[-slice_n:]) / slice_n),
-            "smooth_decrease_success": bool((sum(losses[-slice_n:]) / slice_n) < (sum(losses[:slice_n]) / slice_n)),
-            "per_model_loss_delta": per_model_loss_delta,
-            "per_layer_loss_delta": per_layer_loss_delta,
+            "first_10pct_mean_total_loss": float(sum(total_losses[:slice_n]) / slice_n),
+            "final_10pct_mean_total_loss": float(sum(total_losses[-slice_n:]) / slice_n),
+            "smooth_decrease_success": bool((sum(total_losses[-slice_n:]) / slice_n) < (sum(total_losses[:slice_n]) / slice_n)),
+            "first_10pct_mean_loss": float(sum(total_losses[:slice_n]) / slice_n),
+            "final_10pct_mean_loss": float(sum(total_losses[-slice_n:]) / slice_n),
+            "per_model_inj_loss_delta": per_model_inj_loss_delta,
+            "per_model_route_loss_delta": per_model_route_loss_delta,
+            "per_layer_inj_loss_delta": per_layer_inj_loss_delta,
+            "per_layer_route_loss_delta": per_layer_route_loss_delta,
+            "per_model_loss_delta": per_model_inj_loss_delta,
+            "per_layer_loss_delta": per_layer_inj_loss_delta,
             "per_model_sim_delta": per_model_sim_delta,
             "per_layer_sim_delta": per_layer_sim_delta,
-            "notes": "",
+            "notes": " | ".join(notes_parts),
         }
         save_json(pair_dir / "metrics.json", metrics_payload)
         save_json(
             pair_dir / "metadata.json",
             {
-                "pair_id": pair["pair_id"],
                 "method": self._method_name(),
+                "active_loss": self._active_loss_name(),
+                "objective": self._objective_name(),
+                "lambda_route": float(getattr(getattr(self.attack_cfg, "loss", {}), "lambda_route", 0.0)),
+                "route_eta_attn": self._route_eta_tuple()[0],
+                "route_eta_cls": self._route_eta_tuple()[1],
+                "route_eta_rollout": self._route_eta_tuple()[2],
+                "shallow_layers": list(self.attack_cfg.shallow_layers),
+                "steps": int(self.attack_cfg.pgd.steps),
+                "eps": float(self.attack_cfg.pgd.eps),
+                "step_size": float(self.attack_cfg.pgd.step_size),
+                "topk_ratio": float(self.attack_cfg.topk_ratio),
+                "seed": int(self.runtime_cfg.seed),
                 "selection_mode": str(getattr(self.attack_cfg, "selection_mode", "fas2h")),
+                "static_source_carrier": bool(self.attack_cfg.bank.static_source_carrier),
+                "static_target_bank": bool(self.attack_cfg.bank.static_target_bank),
+                "pair_id": pair["pair_id"],
                 "random_selection_seed": int(getattr(self.runtime_cfg, "random_selection_seed", self.runtime_cfg.seed)),
                 "source_path": pair["source_path"],
                 "target_path": pair["target_path"],
                 "target_keywords": pair.get("target_keywords"),
                 "target_keywords_note": "target_keywords are metadata only and are not used by the attack loss.",
                 "attack_name": self.attack_cfg.name,
-                "active_loss": self.attack_cfg.loss.active,
                 "projection_type": self.attack_cfg.projection.type,
                 "models": [
                     {
@@ -533,7 +785,7 @@ class FAS2HAttack:
             "pair_id": pair["pair_id"],
             "method": self._method_name(),
             "selection_mode": str(getattr(self.attack_cfg, "selection_mode", "fas2h")),
-            "final_loss": loss_log[-1]["loss_inj"] if loss_log else None,
+            "final_loss": loss_log[-1]["loss_total"] if loss_log else None,
             "metrics": metrics_payload,
             "pair_dir": str(pair_dir),
         }
@@ -566,15 +818,33 @@ class FAS2HAttack:
                     "run_id": run_dir.name,
                     "pair_id": result["pair_id"],
                     "method": result["method"],
+                    "objective": metrics.get("objective"),
+                    "active_loss": metrics.get("active_loss"),
+                    "lambda_route": metrics.get("lambda_route"),
                     "selection_mode": result["selection_mode"],
                     "shallow_layers": "|".join(str(v) for v in self.attack_cfg.shallow_layers),
                     "inj_loss_start": metrics["inj_loss_start"],
                     "inj_loss_end": metrics["inj_loss_end"],
                     "inj_loss_delta": metrics["inj_loss_delta"],
+                    "route_loss_start": metrics.get("route_loss_start"),
+                    "route_loss_end": metrics.get("route_loss_end"),
+                    "route_loss_delta": metrics.get("route_loss_delta"),
+                    "total_loss_start": metrics.get("total_loss_start"),
+                    "total_loss_end": metrics.get("total_loss_end"),
+                    "total_loss_delta": metrics.get("total_loss_delta"),
                     "inj_loss_relative_change": metrics["inj_loss_relative_change"],
                     "carrier_target_sim_start": metrics["carrier_target_sim_start"],
                     "carrier_target_sim_end": metrics["carrier_target_sim_end"],
                     "carrier_target_sim_delta": metrics["carrier_target_sim_delta"],
+                    "route_attn_start": metrics.get("route_attn_start"),
+                    "route_attn_end": metrics.get("route_attn_end"),
+                    "route_attn_delta": metrics.get("route_attn_delta"),
+                    "route_cls_coupling_start": metrics.get("route_cls_coupling_start"),
+                    "route_cls_coupling_end": metrics.get("route_cls_coupling_end"),
+                    "route_cls_coupling_delta": metrics.get("route_cls_coupling_delta"),
+                    "route_rollout_start": metrics.get("route_rollout_start"),
+                    "route_rollout_end": metrics.get("route_rollout_end"),
+                    "route_rollout_delta": metrics.get("route_rollout_delta"),
                     "linf_max": metrics["linf_max"],
                     "linf_valid": metrics["linf_valid"],
                     "pixel_range_valid": metrics["pixel_range_valid"],
@@ -593,6 +863,9 @@ class FAS2HAttack:
         summary_json = {
             "run_id": run_dir.name,
             "method": self._method_name(),
+            "objective": self._objective_name(),
+            "active_loss": self._active_loss_name(),
+            "lambda_route": float(getattr(getattr(self.attack_cfg, "loss", {}), "lambda_route", 0.0)),
             "selection_mode": str(getattr(self.attack_cfg, "selection_mode", "fas2h")),
             "shallow_layers": list(self.attack_cfg.shallow_layers),
             "num_pairs": len(summary_rows),
@@ -620,6 +893,9 @@ class FAS2HAttack:
             f"# Run {run_dir.name}",
             "",
             f"- method: {self._method_name()}",
+            f"- objective: {self._objective_name()}",
+            f"- active_loss: {self._active_loss_name()}",
+            f"- lambda_route: {float(getattr(getattr(self.attack_cfg, 'loss', {}), 'lambda_route', 0.0))}",
             f"- selection_mode: {getattr(self.attack_cfg, 'selection_mode', 'fas2h')}",
             f"- shallow_layers: {list(self.attack_cfg.shallow_layers)}",
             f"- topk_ratio: {float(self.attack_cfg.topk_ratio)}",

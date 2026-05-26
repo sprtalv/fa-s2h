@@ -16,9 +16,16 @@ runtime:
   device: auto
   output_dir: outputs/runs
   auto_name: true
+  run_name_include_params: true
+  run_tag: null
   progress: true
 
 logging:
+  record_loss_inj: true
+  record_loss_route: true
+  record_route_attn_score: true
+  record_route_cls_coupling_score: true
+  record_route_rollout_score: true
   record_carrier_target_sim: true
   record_linf: true
   record_pixel_range: true

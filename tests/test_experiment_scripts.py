@@ -115,3 +115,37 @@ def test_find_exp_reports_matching_experiment(tmp_path: Path) -> None:
 
     assert exp_dir.name in result.stdout
     assert "asr=0.4" in result.stdout
+
+
+def test_summarize_exp_reports_command_logs_and_jsonl_counts(tmp_path: Path) -> None:
+    repo_root = make_repo_root(tmp_path)
+    create_result = run_script(
+        "new_exp.py",
+        repo_root,
+        "--name",
+        "fas2h_summary_case",
+        "--config",
+        "configs/attack/fas2h.yaml",
+        "--data-version",
+        "toy-v2",
+        "--seed",
+        "13",
+        "--command",
+        "python scripts/run_attack.py --config-name config runtime.seed=13",
+    )
+    exp_dir = Path(create_result.stdout.strip())
+    (exp_dir / "logs" / "run.log").write_text("loss=-1.0\n", encoding="utf-8")
+    (exp_dir / "captions.jsonl").write_text('{"caption":"a"}\n{"caption":"b"}\n', encoding="utf-8")
+    (exp_dir / "judge_scores.jsonl").write_text('{"score":1}\n', encoding="utf-8")
+
+    result = run_script(
+        "summarize_exp.py",
+        repo_root,
+        "--exp",
+        str(exp_dir),
+    )
+
+    assert "Command preview:" in result.stdout
+    assert "Logs:" in result.stdout
+    assert "captions.jsonl: present (2 lines)" in result.stdout
+    assert "judge_scores.jsonl: present (1 lines)" in result.stdout

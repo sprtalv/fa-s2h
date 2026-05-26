@@ -1,4 +1,4 @@
-"""Attention rollout utilities for target evidence selection.
+"""Attention rollout utilities for target evidence selection and route loss.
 
 Rollout is used here as a proxy for downstream path contribution. It is not an
 exact causal attribution method; the README documents this limitation explicitly.
@@ -91,3 +91,50 @@ def extract_cls_to_patch_rollout(rollout: torch.Tensor) -> torch.Tensor:
     if rollout.dim() != 3:
         raise ValueError(f"Expected rollout shape `[B, T, T]`, got {tuple(rollout.shape)}")
     return rollout[:, 0, 1:]
+
+
+def gather_selected_patch_scores(
+    patch_scores: torch.Tensor,
+    selected_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Gather per-patch scores for selected patch indices.
+
+    Args:
+    - `patch_scores`: tensor `[B, N]`.
+    - `selected_indices`: tensor `[B, K]` with patch-space indices in `[0, N)`.
+
+    Returns:
+    - tensor `[B, K]`.
+    """
+    if patch_scores.dim() != 2:
+        raise ValueError(f"Expected patch_scores shape `[B, N]`, got {tuple(patch_scores.shape)}")
+    if selected_indices.dim() != 2:
+        raise ValueError(f"Expected selected_indices shape `[B, K]`, got {tuple(selected_indices.shape)}")
+    if patch_scores.shape[0] != selected_indices.shape[0]:
+        raise ValueError(
+            "Batch size mismatch between patch_scores and selected_indices: "
+            f"{patch_scores.shape[0]} vs {selected_indices.shape[0]}"
+        )
+    return torch.gather(patch_scores, dim=1, index=selected_indices.long())
+
+
+def cls_to_selected_patch_rollout(
+    attentions_by_layer: Mapping[int, torch.Tensor],
+    layer: int,
+    num_layers: int,
+    selected_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Compute rollout proxy `CLS <- selected patch` for one shallow layer.
+
+    The rollout product uses blocks `[layer + 1, ..., num_layers - 1]`.
+    The returned tensor preserves batch and selection dimensions.
+    """
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be positive, got {num_layers}")
+    rollout_matrix = compute_rollout(
+        attentions_by_layer=attentions_by_layer,
+        start_layer=layer + 1,
+        end_layer=num_layers - 1,
+    )
+    cls_to_patch = extract_cls_to_patch_rollout(rollout_matrix)
+    return gather_selected_patch_scores(cls_to_patch, selected_indices=selected_indices)

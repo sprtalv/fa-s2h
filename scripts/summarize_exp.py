@@ -53,6 +53,13 @@ def last_metrics_row(path: Path) -> dict[str, str] | None:
     return rows[-1] if rows else None
 
 
+def log_file_count(path: Path) -> int:
+    """Count regular files inside a log directory."""
+    if not path.exists() or not path.is_dir():
+        return 0
+    return sum(1 for child in path.rglob("*") if child.is_file())
+
+
 def jsonl_line_count(path: Path) -> int:
     """Count lines in a JSONL file without printing its content."""
     with path.open("r", encoding="utf-8") as handle:
@@ -84,6 +91,12 @@ def main() -> int:
     print(f"Summary status: {summary.get('status', 'unknown')}")
     print(f"Summary metrics: {summary.get('metrics', {})}")
     print(f"Summary result: {summary.get('result_summary', '')}")
+    command_text = read_text_if_exists(exp_dir / "command.sh")
+    if command_text:
+        print("Command preview:")
+        print("\n".join(command_text.splitlines()[:8]))
+    logs_dir = exp_dir / "logs"
+    print(f"Logs: {logs_dir} ({log_file_count(logs_dir)} files)")
 
     if readme_text:
         print("README preview:")

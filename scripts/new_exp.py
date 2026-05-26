@@ -125,6 +125,11 @@ def main() -> int:
         "# Experiment Record\n\n"
         "## Purpose\n\n"
         "TODO(fas2h): describe the experiment goal.\n\n"
+        "## Repro Metadata\n\n"
+        f"- Seed: `{args.seed}`\n"
+        f"- Config source: `{config_path.relative_to(repo_root)}`\n"
+        f"- Data version: `{args.data_version}`\n"
+        f"- Git commit: `{git_commit}`\n\n"
         "## Key Changes\n\n"
         "- TODO(fas2h): list config or code differences.\n\n"
         "## Current Conclusion\n\n"
@@ -140,13 +145,17 @@ def main() -> int:
         "- Resolution or next step: `TODO(fas2h)`\n",
     )
     summary = {
+        "name": exp_name,
         "status": "active",
         "archive": False,
         "deprecated": False,
+        "created_at_utc": stamp.isoformat(),
+        "git_commit": git_commit,
         "seed": args.seed,
         "data_version": args.data_version,
         "config_source": str(config_path.relative_to(repo_root)),
         "command": command_body,
+        "log_dir": "logs",
         "metrics": {},
         "result_summary": "",
         "failure_reason": "",

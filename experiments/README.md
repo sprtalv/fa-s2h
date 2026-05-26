@@ -57,6 +57,7 @@ To make an experiment reproducible after three months, record at least:
 - git commit id
 - data version or dataset snapshot note
 - random seed
+- key logs kept under `logs/` when they matter for debugging
 - final metric summary
 - failure notes if the run did not complete
 

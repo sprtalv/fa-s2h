@@ -1,5 +1,5 @@
 from fas2h import __version__
-from fas2h.attacks.losses import injection_loss_logsumexp
+from fas2h.attacks.losses import injection_loss_logsumexp, route_loss
 from fas2h.features import BankBundle, FeatureBundle, RouteBundle
 from fas2h.route.cache_keys import build_cache_key
 from fas2h.route.rollout import add_residual_and_normalize, average_heads, compute_rollout, extract_cls_to_patch_rollout
@@ -12,6 +12,7 @@ def test_basic_imports() -> None:
     assert BankBundle is not None
     assert callable(build_cache_key)
     assert callable(injection_loss_logsumexp)
+    assert callable(route_loss)
     assert callable(average_heads)
     assert callable(add_residual_and_normalize)
     assert callable(compute_rollout)

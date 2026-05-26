@@ -1,6 +1,8 @@
 name: fas2h_mvp
+objective: inj_only
+active_loss: inj_only
 selection_mode: fas2h
-shallow_layers: [0, 1, 2, 3]
+shallow_layers: [1, 2, 3, 4, 5, 6]
 layer_index_base: 0
 topk_ratio: 0.2
 
@@ -24,13 +26,18 @@ loss:
   tau: 0.07
   lambda_route: 0.0
   lambda_anchor: 0.0
+  route:
+    enabled: false
+    eta_attn: 0.3333333333
+    eta_cls: 0.3333333333
+    eta_rollout: 0.3333333333
   route_loss_enabled: false
   anchor_loss_enabled: false
 
 pgd:
   eps: 0.062745098
   step_size: 0.0039215686
-  steps: 50
+  steps: 300
   random_start: false
   clamp_min: 0.0
   clamp_max: 1.0
