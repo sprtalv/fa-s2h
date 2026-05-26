@@ -12,10 +12,21 @@ project:
 
 runtime:
   seed: 42
+  random_selection_seed: 42
   device: auto
   output_dir: outputs/runs
   auto_name: true
   progress: true
+
+logging:
+  record_carrier_target_sim: true
+  record_linf: true
+  record_pixel_range: true
+  record_mean_abs_delta: true
+  record_per_model_loss: true
+  record_per_layer_loss: true
+  record_score_decomposition: true
+  record_high_freq_energy: false
 
 hydra:
   run:

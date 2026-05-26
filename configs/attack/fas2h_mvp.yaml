@@ -1,4 +1,5 @@
 name: fas2h_mvp
+selection_mode: fas2h
 shallow_layers: [0, 1, 2, 3]
 layer_index_base: 0
 topk_ratio: 0.2

@@ -38,6 +38,21 @@ def injection_loss_logsumexp(
     return -torch.logsumexp(logits, dim=-1).mean()
 
 
+def carrier_target_similarity(
+    adv_patch_tokens: torch.Tensor,
+    target_bank: torch.Tensor,
+    projection,
+    layer: int,
+) -> torch.Tensor:
+    """Compute mean of per-carrier max cosine similarity to target bank."""
+    projected_adv = projection.project(layer, adv_patch_tokens)
+    projected_bank = projection.project(layer, target_bank.detach())
+    adv_norm = F.normalize(projected_adv, dim=-1)
+    bank_norm = F.normalize(projected_bank, dim=-1)
+    sims = adv_norm @ bank_norm.transpose(-1, -2)
+    return sims.max(dim=-1).values.mean()
+
+
 def route_loss(*args, **kwargs) -> torch.Tensor:
     """Placeholder for future route amplification loss.
 
