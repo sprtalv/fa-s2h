@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 from omegaconf import OmegaConf
+from tqdm.auto import tqdm
 
 from fas2h.attacks.losses import injection_loss_logsumexp
 from fas2h.attacks.pgd import pgd_step
@@ -66,6 +67,7 @@ class FAS2HAttack:
 
         for model in self.models:
             model.load()
+        self.logger.info("Resolved runtime device: %s", self.models[0].model_device)
 
     def _data_name(self) -> str:
         """Build a short dataset token from the configured pair file."""
@@ -257,7 +259,13 @@ class FAS2HAttack:
             x_adv = (x_adv + torch.empty_like(x_adv).uniform_(-eps, eps)).clamp(0.0, 1.0)
 
         loss_log: list[dict[str, float]] = []
-        for step_idx in range(int(self.attack_cfg.pgd.steps)):
+        step_iter = tqdm(
+            range(int(self.attack_cfg.pgd.steps)),
+            desc=f"{pair['pair_id']} steps",
+            leave=False,
+            disable=not bool(getattr(self.runtime_cfg, "progress", True)),
+        )
+        for step_idx in step_iter:
             x_adv.requires_grad_(True)
             loss = self._compute_injection_objective(
                 x_adv=x_adv,
@@ -275,7 +283,10 @@ class FAS2HAttack:
                     clamp_min=float(self.attack_cfg.pgd.clamp_min),
                     clamp_max=float(self.attack_cfg.pgd.clamp_max),
                 )
-            loss_log.append({"step": float(step_idx), "loss": float(loss.detach().cpu().item())})
+            loss_value = float(loss.detach().cpu().item())
+            loss_log.append({"step": float(step_idx), "loss": loss_value})
+            if bool(getattr(self.runtime_cfg, "progress", True)):
+                step_iter.set_postfix(loss=f"{loss_value:.4f}")
 
         delta = x_adv - x_src
         save_image_tensor(x_adv, pair_dir / "adv.png")
@@ -321,7 +332,12 @@ class FAS2HAttack:
             pairs = pairs[: int(self.data_cfg.limit)]
 
         results = []
-        for pair in pairs:
+        pair_iter = tqdm(
+            pairs,
+            desc="pairs",
+            disable=not bool(getattr(self.runtime_cfg, "progress", True)),
+        )
+        for pair in pair_iter:
             self.logger.info("Running FA-S2H MVP for pair_id=%s", pair["pair_id"])
             results.append(self.run_pair(pair=deepcopy(pair), run_dir=run_dir))
         return results
