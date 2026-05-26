@@ -12,5 +12,15 @@ __pycache__/
 wandb/
 .DS_Store
 .cache/
-data/
 logs/
+data/raw/
+data/processed/
+experiments/**/logs/
+experiments/**/checkpoints/
+!experiments/**/README.md
+!experiments/**/failures.md
+!experiments/**/summary.json
+!experiments/**/config.yaml
+!experiments/**/command.sh
+!experiments/**/git_commit.txt
+!experiments/**/data_version.txt

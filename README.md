@@ -328,6 +328,97 @@ File meanings:
 - `metadata.json`: pair information, model list, and relevant settings.
 - `config_used.yaml`: full Hydra config used for the run.
 
+## Experiment Management
+
+This repository keeps a single shared `src/` implementation and stores experiment-specific metadata under `experiments/`.
+That separation matters because reproducibility improves when algorithm code stays centralized while run records stay local to each experiment folder.
+
+Experiment directories:
+
+- `experiments/active/`: current runs and analyses.
+- `experiments/archive/`: finished runs worth keeping as references.
+- `experiments/graveyard/`: failed or abandoned runs that should still keep their audit trail.
+
+Create a new experiment:
+
+```bash
+python scripts/new_exp.py \
+  --name fas2h_clip3_topk32_seed42 \
+  --config configs/attack/fas2h_mvp.yaml \
+  --data-version unknown \
+  --seed 42
+```
+
+This creates `experiments/active/YYYYMMDD_<name>/` and records:
+
+- copied `config.yaml`
+- `command.sh`
+- `git_commit.txt`
+- `data_version.txt`
+- `README.md`
+- `failures.md`
+- `summary.json`
+- `logs/`
+
+Archive or discard an experiment:
+
+```bash
+python scripts/archive_exp.py \
+  --exp experiments/active/20260526_fas2h_clip3_topk32_seed42 \
+  --to archive \
+  --reason "stable pilot result kept for comparison"
+```
+
+Use `--to graveyard` for failed or invalid runs.
+The script refuses to overwrite an existing destination and appends the archive reason to the experiment record.
+
+Find experiments:
+
+```bash
+python scripts/find_exp.py --keyword fas2h
+python scripts/find_exp.py --date 20260526
+python scripts/find_exp.py --status active
+python scripts/find_exp.py --metric asr
+```
+
+Summarize one experiment:
+
+```bash
+python scripts/summarize_exp.py \
+  --exp experiments/active/20260526_fas2h_clip3_topk32_seed42
+```
+
+Recommended naming pattern:
+
+- `YYYYMMDD_method_setting_seedXX`
+
+For example:
+
+- `20260526_fas2h_clip3_topk32_seed42`
+
+Every experiment directory should record:
+
+- exact or intended command
+- copied config
+- git commit id
+- data version
+- random seed
+- key logs
+- metric summary
+- failure reason when applicable
+
+Failed experiments should not be deleted silently.
+Record the failure in `failures.md`, store the short reason in `summary.json`, and move the directory to `graveyard/` when it is no longer active.
+
+Why seed, dependency version, data version, and git commit matter:
+
+- seed helps explain run-to-run variance
+- dependency versions help isolate environment drift
+- data version prevents comparing runs built on different samples or preprocessing
+- git commit id ties the result to the exact code snapshot
+
+If the environment differs from the default repo setup, record that difference in the experiment `README.md`.
+
 ## 9.10 Known Limitations
 
 - Attention rollout is only a proxy for information flow, not exact causal attribution.
